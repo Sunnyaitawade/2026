@@ -1,224 +1,162 @@
 # Kafka Common Utils
 
-A reusable **Kafka utility library for Spring Boot microservices** that centralizes Kafka producer, consumer, serialization, and configuration logic.
-Designed to reduce boilerplate and ensure consistent Kafka usage across services.
+## Overview
+
+Kafka Common Utils is a lightweight utility library designed to standardize **Kafka consumer patterns** across Spring Boot microservices. It focuses on **safe offset handling**, **retry visibility**, and **DLT observability**, making it especially suitable for **payments and event-driven systems**.
+
+This library provides:
+
+* Generic base Kafka listener abstraction
+* Consistent JSON deserialization
+* Header-based retry attempt tracking
+* First-class support for Spring Kafka `@RetryableTopic`
 
 ---
 
-## 🚀 Features
+## ✨ New Features (Latest Update)
 
-* Generic Kafka **Producer** & **Consumer**
-* JSON serialization / deserialization
-* Centralized Kafka configuration
-* Reusable DTOs & topic constants
-* Easy plug-and-play integration
-* Java 17 + Spring Boot compatible
-* Production-ready structure (payments / fintech friendly)
+### 1. Generic `BaseKafkaListener<T>`
+
+A reusable abstract listener that:
+
+* Centralizes JSON → Object conversion
+* Avoids duplicate deserialization logic
+* Promotes consistent error handling
+
+```java
+public abstract class BaseKafkaListener<T> {
+    protected final ObjectMapper objectMapper;
+    private final Class<T> type;
+
+    protected BaseKafkaListener(ObjectMapper objectMapper, Class<T> type) {
+        this.objectMapper = objectMapper;
+        this.type = type;
+    }
+
+    protected T convert(String message) {
+        try {
+            return objectMapper.readValue(message, type);
+        } catch (Exception e) {
+            throw new RuntimeException("Kafka message conversion failed", e);
+        }
+    }
+}
+```
 
 ---
 
-## 📦 Tech Stack
+### 2. Header-Based Retry Attempt Tracking ✅
 
-* Java 17
-* Spring Boot
+The library now supports **retry attempt visibility using Kafka headers** when used with Spring Kafka `@RetryableTopic`.
+
+Spring Kafka automatically injects retry metadata into message headers, which can be consumed for:
+
+* Logging
+* Metrics
+* Conditional retry logic
+* Debugging production failures
+
+#### Supported Headers
+
+| Header                          | Description                  |
+| ------------------------------- | ---------------------------- |
+| `retry_topic-attempts`          | Current retry attempt number |
+| `retry_topic-original-topic`    | Original topic name          |
+| `retry_topic-exception-message` | Exception message            |
+| `retry_topic-exception-class`   | Exception class              |
+| `kafka_receivedTopic`           | Current topic                |
+| `kafka_offset`                  | Record offset                |
+
+---
+
+### 3. Retry-Aware Consumer Example
+
+```java
+@RetryableTopic(attempts = "3", dltTopicSuffix = "-DLT")
+@KafkaListener(topics = KafkaTopics.PAYMENT_EVENT, groupId = "libtest-group")
+public void consume(String message, @Headers MessageHeaders headers) {
+
+    PaymentEvent event = convert(message);
+
+    int attempt = (int) headers.getOrDefault(
+            RetryTopicHeaders.DEFAULT_HEADER_ATTEMPTS, 0
+    );
+
+    String topic = (String) headers.get(KafkaHeaders.RECEIVED_TOPIC);
+
+    log.info("Topic={} | RetryAttempt={} | Event={}", topic, attempt, event);
+
+    if (event.isRetryableFailure()) {
+        throw new RuntimeException("Simulated failure");
+    }
+}
+```
+
+---
+
+### 4. DLT Handling with Full Context
+
+```java
+@DltHandler
+public void dlt(String message, @Headers MessageHeaders headers) {
+
+    PaymentEvent event = convert(message);
+
+    String originalTopic = (String)
+            headers.get(RetryTopicHeaders.DEFAULT_HEADER_ORIGINAL_TOPIC);
+
+    int attempts = (int)
+            headers.get(RetryTopicHeaders.DEFAULT_HEADER_ATTEMPTS);
+
+    String error = (String)
+            headers.get(RetryTopicHeaders.DEFAULT_HEADER_EXCEPTION_MESSAGE);
+
+    log.error("DLT | OriginalTopic={} | Attempts={} | Error={} | Event={}",
+            originalTopic, attempts, error, event);
+}
+```
+
+---
+
+## 🔄 Offset Management Behavior
+
+| Scenario              | Offset Commit         |
+| --------------------- | --------------------- |
+| Successful processing | ✅ Committed           |
+| Retry attempt         | ❌ Not committed       |
+| Sent to DLT           | ✅ Committed after DLT |
+
+This ensures **at-least-once processing** with full retry transparency.
+
+---
+
+## 📦 Use Cases
+
+* Payment event processing
+* Fraud / non-fraud workflows
+* Audit-safe event consumers
+* Shared Kafka consumer standards across teams
+
+---
+
+## 🚀 Roadmap
+
+* Retry header utility helper (`RetryHeaderUtil`)
+* Centralized DLT consumer module
+* Micrometer metrics integration
+* Support for non-retryable exception classification
+
+---
+
+## 🛠 Requirements
+
+* Java 17+
+* Spring Boot 3.x
 * Spring Kafka
-* Apache Kafka
-* Jackson
-
----
-
-## 📁 Module Structure
-
-```
-kafka-common-utils
-│
-├── config
-│   ├── KafkaProducerConfig.java
-│   ├── KafkaConsumerConfig.java
-│
-├── publisher
-│   └── KafkaEventPublisher.java
-│
-├── consumer
-│   └── BaseKafkaListener.java
-│
-├── serializer
-│   ├── GenericJsonSerializer.java
-│   └── GenericJsonDeserializer.java
-│
-├── model
-│   └── PaymentEvent.java
-│
-├── constants
-│   └── KafkaTopics.java
-```
-
----
-
-## 🔧 Installation
-
-### 1️⃣ Build & Install Library
-
-```bash
-mvn clean install
-```
-
-This installs the library into your local Maven repository.
-
----
-
-### 2️⃣ Add Dependency in Microservice
-
-```xml
-<dependency>
-  <groupId>com.common</groupId>
-  <artifactId>kafka-common-utils</artifactId>
-  <version>1.0.1</version>
-</dependency>
-```
-
----
-
-## ⚙️ Configuration
-
-### application.properties
-
-```properties
-# Kafka bootstrap server
-kafka.bootstrap-servers=localhost:9092
-
-# Consumer
-spring.kafka.consumer.group-id=payment-group
-spring.kafka.consumer.auto-offset-reset=earliest
-```
-
----
-
-## ✉️ Publishing Events
-
-```java
-@RestController
-@RequestMapping("/test")
-public class TestProducerController {
-
-    private final KafkaEventPublisher publisher;
-
-    public TestProducerController(KafkaEventPublisher publisher) {
-        this.publisher = publisher;
-    }
-
-    @PostMapping("/publish")
-    public String publish(@RequestBody PaymentEvent event) {
-        publisher.publish(KafkaTopics.PAYMENT_EVENT, event);
-        return "Event published successfully";
-    }
-}
-```
-
----
-
-## 📥 Consuming Events
-
-```java
-@Component
-public class PaymentEventListener extends BaseKafkaListener<PaymentEvent> {
-
-    @Override
-    @KafkaListener(
-        topics = KafkaTopics.PAYMENT_EVENT,
-        groupId = "payment-group"
-    )
-    public void listen(PaymentEvent event) {
-        log.info("Received Payment Event: {}", event);
-    }
-}
-```
-
----
-
-## 🧪 Testing
-
-### Postman API
-
-```
-POST http://localhost:8085/test/publish
-```
-
-```json
-{
-  "transactionId": "TXN-001",
-  "amount": 1200.50,
-  "status": "SUCCESS"
-}
-```
-
----
-
-## 🧠 Topic Management
-
-* Auto topic creation is enabled for local development
-* For production, topics should be created explicitly with:
-
-    * Partition count
-    * Replication factor
-    * Retention policy
-
-Example:
-
-```java
-@Bean
-public NewTopic paymentEventsTopic() {
-    return TopicBuilder.name("payment-events")
-        .partitions(3)
-        .replicas(1)
-        .build();
-}
-```
-
----
-
-## 🏭 Production Best Practices
-
-* Disable auto topic creation in production
-* Use versioned topics (`payment-events.v1`)
-* Add retry & Dead Letter Topics (DLT)
-* Use headers for correlationId / traceId
-* Consider Avro + Schema Registry
-* Enable exactly-once semantics if required
-
----
-
-## 🔐 Compatibility
-
-| Component   | Version   |
-| ----------- | --------- |
-| Java        | 17+       |
-| Spring Boot | 3.x / 4.x |
-| Kafka       | 3.x+      |
-
----
-
-## 📌 Roadmap
-
-* Retry & Dead Letter Topic support
-* Spring Boot auto-configuration starter
-* Kafka headers support
-* Avro & Schema Registry integration
-* Reactive Kafka support
-
----
-
-## 👨‍💻 Author
-
-**Sunny Aitawade**
-Senior Java Developer | Kafka | Spring Boot | Payments & FinTech
+* Apache Kafka (ZooKeeper or KRaft)
 
 ---
 
 ## 📄 License
 
-This project is licensed for internal / educational use.
-Open-source licensing can be added as needed.
-
----
- 
+Internal / Company Use
